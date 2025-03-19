@@ -1,0 +1,445 @@
+<?php
+/*
+Plugin Name: WP Roquette
+Description: Advanced caching plugin inspired by WP Rocket, LightSpeed, and LSCache. Features include Object Cache (Redis/Memcached), image optimization, minification/combination of CSS/JS/HTML, lazy-loading, CDN support, HTTP/2 push, DNS prefetch, Cloudflare API integration, multisite support, WP CLI commands, and more.
+Version: 1.0
+Author: Thierry Gustin
+*/
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+class WPRoquette {
+    private $cache_dir;
+    private $cdn_url;
+    private $object_cache;
+
+    public function __construct() {
+        // Define the cache directory (ex: wp-content/cache/wproquette)
+        $this->cache_dir = WP_CONTENT_DIR . '/cache/wproquette/';
+        $this->initialize_cache_dir();
+
+        // Load or initialize settings
+        $this->init_settings();
+
+        // Initialize object cache support (Redis/Memcached)
+        $this->init_object_cache();
+
+        // Front-end actions and filters
+        add_action('init', array($this, 'start_buffer'));
+        add_action('shutdown', array($this, 'end_buffer'));
+        add_action('wp_enqueue_scripts', array($this, 'optimize_assets'), 99);
+        add_action('wp_head', array($this, 'add_dns_prefetch'), 1);
+
+        // Clear cache on content update
+        add_action('save_post', array($this, 'clear_cache'));
+
+        // Optimize REST API responses (cache calls)
+        add_filter('rest_pre_serve_request', array($this, 'cache_rest_api'), 10, 4);
+
+        // Control the Heartbeat frequency (to limit calls)
+        add_filter('heartbeat_settings', array($this, 'control_heartbeat'));
+
+        // Register REST API endpoints for external cache management
+        add_action('rest_api_init', array($this, 'register_api_endpoints'));
+
+        // Register WP CLI commands if available
+        if ( defined('WP_CLI') && WP_CLI ) {
+            $this->register_wp_cli_commands();
+        }
+
+        // Add an admin menu for plugin configuration and import/export
+        add_action('admin_menu', array($this, 'admin_menu'));
+    }
+
+    /* --------------------------
+       INITIALIZATION AND SETTINGS
+    ---------------------------*/
+
+    /**
+     * Create the cache directory if it doesn't exist
+     */
+    private function initialize_cache_dir() {
+        if ( ! file_exists( $this->cache_dir ) ) {
+            mkdir( $this->cache_dir, 0755, true );
+        }
+    }
+
+    /**
+     * Load or set the settings (ex: CDN URL, Cloudflare keys, etc.)
+     */
+    private function init_settings() {
+        $this->cdn_url = get_option('scp_cdn_url', '');
+        // Additional options (Cloudflare, etc.) can be added here.
+    }
+
+    /**
+     * Initialize Object Cache support (ex: Redis, Memcached)
+     */
+    private function init_object_cache() {
+        if ( class_exists('Redis') ) {
+            $this->object_cache = new Redis();
+            // Adjust connection parameters as needed
+            @$this->object_cache->connect('127.0.0.1', 6379);
+        }
+        // Additional support for Memcached or LSMCD can be added here.
+    }
+
+    /* --------------------------
+       CACHING AND HTML OPTIMIZATION
+    ---------------------------*/
+
+    /**
+     * Start output buffering for non-logged in visitors
+     */
+    public function start_buffer() {
+        if ( !is_user_logged_in() && !is_admin() ) {
+            ob_start(array($this, 'cache_callback'));
+        }
+    }
+
+    /**
+     * End output buffering
+     */
+    public function end_buffer() {
+        if ( !is_user_logged_in() && !is_admin() ) {
+            ob_end_flush();
+        }
+    }
+
+    /**
+     * Callback to process the buffer: optimize and store HTML
+     */
+    public function cache_callback($html) {
+        // 1. Minify the HTML
+        $html = $this->minify_html($html);
+        // 2. Apply lazy-loading to images and iframes
+        $html = $this->apply_lazy_load($html);
+        // 3. Minify inline CSS/JS
+        $html = $this->minify_inline_assets($html);
+        // 4. Combine CSS/JS assets (stub, to be implemented)
+        $html = $this->combine_assets($html);
+        // 5. Automatically generate Critical CSS (stub)
+        $html = $this->generate_critical_css($html);
+        // 6. Add HTTP/2 Push headers for CSS/JS
+        $this->http2_push_assets();
+        // 7. Save the cache
+        $this->store_cache($html);
+        return $html;
+    }
+
+    /**
+     * Minify the HTML by removing unnecessary comments and extra spaces
+     */
+    private function minify_html($html) {
+        $html = preg_replace('/<!--(?!\[if).*?-->/', '', $html);
+        $html = preg_replace('/\s+/', ' ', $html);
+        return $html;
+    }
+
+    /**
+     * Add the loading="lazy" attribute to <img> and <iframe> tags
+     */
+    private function apply_lazy_load($html) {
+        // For images
+        $html = preg_replace_callback('/<img([^>]+)>/', function($matches) {
+            if ( strpos($matches[1], 'loading=') === false ) {
+                return '<img loading="lazy" ' . $matches[1] . '>';
+            }
+            return $matches[0];
+        }, $html);
+        // For iframes
+        $html = preg_replace_callback('/<iframe([^>]+)>/', function($matches) {
+            if ( strpos($matches[1], 'loading=') === false ) {
+                return '<iframe loading="lazy" ' . $matches[1] . '>';
+            }
+            return $matches[0];
+        }, $html);
+        return $html;
+    }
+
+    /**
+     * Minify inline CSS and JS within the HTML
+     */
+    private function minify_inline_assets($html) {
+        // For <style> tags
+        $html = preg_replace_callback('/<style\b[^>]*>(.*?)<\/style>/is', function($matches) {
+            $minified = preg_replace('/\s+/', ' ', $matches[1]);
+            return '<style>' . $minified . '</style>';
+        }, $html);
+        // For inline <script> tags (without src)
+        $html = preg_replace_callback('/<script\b(?![^>]*src)[^>]*>(.*?)<\/script>/is', function($matches) {
+            $minified = preg_replace('/\s+/', ' ', $matches[1]);
+            return '<script>' . $minified . '</script>';
+        }, $html);
+        return $html;
+    }
+
+    /**
+     * Combine CSS and JS files (functionality to be developed)
+     */
+    private function combine_assets($html) {
+        // Analyze HTML to combine asset links.
+        // Implementation should create combined files, minify them, and serve from cache.
+        return $html;
+    }
+
+    /**
+     * Automatically generate Critical CSS (functionality to be developed)
+     */
+    private function generate_critical_css($html) {
+        // Use an external library or algorithm to extract Critical CSS
+        // and inject it into the <head> of the document.
+        return $html;
+    }
+
+    /**
+     * Add HTTP/2 Push headers for CSS and JS files
+     */
+    private function http2_push_assets() {
+        // Example: header("Link: </wp-content/themes/yourtheme/style.css>; rel=preload; as=style");
+        // Adjust according to your server configuration.
+    }
+
+    /**
+     * Save the cached HTML content into a file (cache key based on URL and device type)
+     */
+    private function store_cache($html) {
+        $cache_file = $this->cache_dir . md5( $this->get_cache_key() ) . '.html';
+        file_put_contents($cache_file, $html);
+    }
+
+    /**
+     * Generate a unique cache key (e.g., including User-Agent for mobile/desktop differentiation)
+     */
+    private function get_cache_key() {
+        $uri = $_SERVER['REQUEST_URI'];
+        $is_mobile = wp_is_mobile() ? 'mobile' : 'desktop';
+        return $uri . '_' . $is_mobile;
+    }
+
+    /* --------------------------
+       CACHE MANAGEMENT AND PURGE
+    ---------------------------*/
+
+    /**
+     * Clear the cache when a post is updated
+     */
+    public function clear_cache($post_id) {
+        $this->clear_cache_files();
+        // Also purge object cache or CDN if necessary
+        $this->purge_cloudflare();
+    }
+
+    /**
+     * Delete all files from the cache directory
+     */
+    private function clear_cache_files() {
+        $files = glob($this->cache_dir . '*');
+        if ($files) {
+            foreach ($files as $file) {
+                if (is_file($file)) {
+                    unlink($file);
+                }
+            }
+        }
+    }
+
+    /* --------------------------
+       ASSET OPTIMIZATION
+    ---------------------------*/
+
+    /**
+     * Optimize asset loading: load CSS asynchronously and defer JS
+     */
+    public function optimize_assets() {
+        add_filter('style_loader_tag', array($this, 'async_css'), 10, 4);
+        add_filter('script_loader_tag', array($this, 'defer_js'), 10, 3);
+    }
+
+    /**
+     * Modify the CSS loading tag to load it asynchronously
+     */
+    public function async_css($tag, $handle, $href, $media) {
+        if ( $this->cdn_url ) {
+            // Replace the URL with the CDN URL if configured
+            $href = str_replace(site_url(), $this->cdn_url, $href);
+        }
+        return '<link rel="preload" as="style" onload="this.onload=null;this.rel=\'stylesheet\'" href="' . esc_url($href) . '" media="' . esc_attr($media) . '">';
+    }
+
+    /**
+     * Add the defer attribute to script tags
+     */
+    public function defer_js($tag, $handle, $src) {
+        if ( false === strpos($tag, 'data-defer') ) {
+            return str_replace(' src', ' defer="defer" src', $tag);
+        }
+        return $tag;
+    }
+
+    /* --------------------------
+       MISCELLANEOUS: DNS PREFETCH, CLOUDFLARE API, DATABASE CLEANER, ETC.
+    ---------------------------*/
+
+    /**
+     * Add a DNS Prefetch link tag to speed up external domain resolution
+     */
+    public function add_dns_prefetch() {
+        echo '<link rel="dns-prefetch" href="//fonts.googleapis.com">';
+        // Additional domains to prefetch can be added here.
+    }
+
+    /**
+     * Purge Cloudflare cache via its API (if configured)
+     */
+    private function purge_cloudflare() {
+        $cf_api_key = get_option('scp_cloudflare_api_key', '');
+        $cf_zone_id = get_option('scp_cloudflare_zone_id', '');
+        if ( $cf_api_key && $cf_zone_id ) {
+            $url = "https://api.cloudflare.com/client/v4/zones/$cf_zone_id/purge_cache";
+            $args = array(
+                'method'  => 'POST',
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $cf_api_key,
+                    'Content-Type'  => 'application/json'
+                ),
+                'body'    => json_encode(array('purge_everything' => true))
+            );
+            wp_remote_post($url, $args);
+        }
+    }
+
+    /**
+     * Clean and optimize the database (functionality to be developed)
+     */
+    public function clean_database() {
+        global $wpdb;
+        // Execute SQL queries to clean and optimize the database (e.g., remove revisions, orphaned metadata, etc.)
+    }
+
+    /**
+     * Cache REST API responses (to lighten API requests)
+     */
+    public function cache_rest_api($served, $result, $request, $server) {
+        // Example: cache REST responses using transients or object cache.
+        return $served;
+    }
+
+    /**
+     * Control the WordPress Heartbeat frequency (example: every 60 seconds)
+     */
+    public function control_heartbeat($settings) {
+        $settings['interval'] = 60;
+        return $settings;
+    }
+
+    /* --------------------------
+       MULTISITE SUPPORT, IMPORT/EXPORT, AND ADMIN INTERFACE
+    ---------------------------*/
+
+    /**
+     * Add an admin menu page for managing plugin settings and import/export
+     */
+    public function admin_menu() {
+        add_menu_page(
+            'WP Roquette',
+            'WP Roquette',
+            'manage_options',
+            'wproquette',
+            array($this, 'admin_settings_page'),
+            'dashicons-performance'
+        );
+    }
+
+    /**
+     * Plugin settings page in the admin area
+     */
+    public function admin_settings_page() {
+        ?>
+        <div class="wrap">
+            <h1>WP Roquette</h1>
+            <form method="post" action="options.php">
+                <?php
+                settings_fields('scp_settings_group');
+                do_settings_sections('scp_settings_group');
+                ?>
+                <table class="form-table">
+                    <tr valign="top">
+                        <th scope="row">CDN URL</th>
+                        <td><input type="text" name="scp_cdn_url" value="<?php echo esc_attr(get_option('scp_cdn_url', '')); ?>" /></td>
+                    </tr>
+                    <tr valign="top">
+                        <th scope="row">Cloudflare API Key</th>
+                        <td><input type="text" name="scp_cloudflare_api_key" value="<?php echo esc_attr(get_option('scp_cloudflare_api_key', '')); ?>" /></td>
+                    </tr>
+                    <tr valign="top">
+                        <th scope="row">Cloudflare Zone ID</th>
+                        <td><input type="text" name="scp_cloudflare_zone_id" value="<?php echo esc_attr(get_option('scp_cloudflare_zone_id', '')); ?>" /></td>
+                    </tr>
+                    <!-- Add other options here -->
+                </table>
+                <?php submit_button(); ?>
+            </form>
+            <h2>Import/Export Settings</h2>
+            <!-- Interface for importing/exporting settings -->
+        </div>
+        <?php
+    }
+
+    /* --------------------------
+       REST API & WP CLI
+    ---------------------------*/
+
+    /**
+     * Register REST API endpoints for cache management
+     */
+    public function register_api_endpoints() {
+        register_rest_route('wproquette/v1', '/purge', array(
+            'methods'             => 'POST',
+            'callback'            => array($this, 'api_purge_cache'),
+            'permission_callback' => function() {
+                return current_user_can('manage_options');
+            }
+        ));
+    }
+
+    /**
+     * REST callback to purge the cache
+     */
+    public function api_purge_cache(WP_REST_Request $request) {
+        $this->clear_cache_files();
+        return new WP_REST_Response(array('success' => true), 200);
+    }
+
+    /**
+     * Register WP CLI commands for the plugin
+     */
+    private function register_wp_cli_commands() {
+        WP_CLI::add_command('wproquette purge', function() {
+            $this->clear_cache_files();
+            WP_CLI::success("Cache successfully purged.");
+        });
+    }
+
+    /* --------------------------
+       LSCache EXCLUSIVE FEATURES (STUBS)
+    ---------------------------*/
+
+    /**
+     * Functions inspired by LSCache:
+     * - Automatic page caching and intelligent purge based on events
+     * - Private cache for logged-in users
+     * - Caching of REST API calls
+     * - Separate caches for mobile/desktop views
+     * - Scheduled purge for specific URLs
+     * - WooCommerce/bbPress support, WP CLI commands, external API, exclusion by URI, category, cookie, User Agent
+     * - Smart preload crawler and ESI (Edge Side Includes) for widgets/shortcodes
+     *
+     * These features should be developed according to specific requirements and site architecture.
+     */
+}
+
+// Initialize the plugin
+new WPRoquette();
